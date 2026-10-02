@@ -20,17 +20,34 @@ THRESHOLD = 23.0
 INTERVAL = "5m"
 WINDOW_CANDLES = 25
 
-SCAN_INTERVAL = 300  # 5 minutes
+SCAN_INTERVAL = 300
 
-MAX_WORKERS = 20
-
-SPOT_URL = "https://data-api.binance.vision"
-FUTURES_URL = "https://fapi.binance.com"
+MAX_WORKERS = 15
 
 PORT = int(os.environ.get("PORT", "10000"))
 
+
+# ============================================================
+# BINANCE ENDPOINTS
+# ============================================================
+
+SPOT_ENDPOINTS = [
+    "https://data-api.binance.vision",
+    "https://api.binance.com",
+]
+
+FUTURES_ENDPOINTS = [
+    "https://fapi.binance.com",
+]
+
+
+# ============================================================
+# HEADERS
+# ============================================================
+
 HEADERS = {
-    "User-Agent": "TheKingdomRender/1.0"
+    "User-Agent": "TheKingdomRender/2.0",
+    "Accept": "application/json",
 }
 
 
@@ -42,13 +59,18 @@ alerted = set()
 
 state_lock = threading.Lock()
 
+scanner_running = False
+
 last_scan_time = 0
 last_scan_duration = 0
 
 spot_count = 0
 futures_count = 0
 
-scanner_running = False
+spot_api_status = "not tested"
+futures_api_status = "not tested"
+
+last_error = ""
 
 
 # ============================================================
@@ -61,65 +83,130 @@ session.headers.update(HEADERS)
 
 
 # ============================================================
-# BINANCE API
+# LOGGING
 # ============================================================
 
-def api_get(base_url, path, params=None):
+def log(message):
 
-    url = base_url + path
+    print(
+        message,
+        flush=True
+    )
 
-    for attempt in range(3):
 
-        try:
+# ============================================================
+# BINANCE REQUEST
+# ============================================================
 
-            response = session.get(
-                url,
-                params=params,
-                timeout=20
-            )
+def api_get(
+    endpoints,
+    path,
+    params=None,
+    label="API"
+):
 
-            if response.status_code == 200:
+    last_error_message = None
 
-                return response.json()
+    for base_url in endpoints:
 
-            if response.status_code in (418, 429):
+        url = base_url + path
 
-                retry_after = response.headers.get(
-                    "Retry-After",
-                    "5"
+        log(
+            f"[{label}] GET {url}"
+        )
+
+        for attempt in range(2):
+
+            try:
+
+                response = session.get(
+                    url,
+                    params=params,
+                    timeout=10
                 )
 
-                try:
-                    wait = int(retry_after)
-                except Exception:
-                    wait = 5
-
-                print(
-                    f"Rate limited: {url} "
-                    f"waiting {wait}s"
+                log(
+                    f"[{label}] "
+                    f"HTTP {response.status_code} "
+                    f"from {base_url}"
                 )
 
-                time.sleep(wait)
+                if response.status_code == 200:
 
-                continue
+                    return response.json()
 
-            print(
-                f"API error {response.status_code}: "
-                f"{url}"
-            )
+                if response.status_code in (418, 429):
 
-            return None
+                    wait = int(
+                        response.headers.get(
+                            "Retry-After",
+                            "5"
+                        )
+                    )
 
-        except Exception as e:
+                    log(
+                        f"[{label}] "
+                        f"Rate limited. "
+                        f"Waiting {wait}s"
+                    )
 
-            print(
-                f"Request error: "
-                f"{url} -> {e}"
-            )
+                    time.sleep(
+                        min(wait, 15)
+                    )
 
-            time.sleep(2)
+                    continue
 
-    return None
+                text = response.text[:300]
+
+                log(
+                    f"[{label}] "
+                    f"Error body: {text}"
+                )
+
+                last_error_message = (
+                    f"HTTP {response.status_code} "
+                    f"from {base_url}"
+                )
+
+                break
+
+            except requests.exceptions.Timeout:
+
+                log(
+                    f"[{label}] "
+                    f"TIMEOUT from {base_url}"
+                )
+
+                last_error_message = (
+                    f"Timeout from {base_url}"
+                )
+
+            except requests.exceptions.RequestException as e:
+
+                log(
+                    f"[{label}] "
+                    f"REQUEST ERROR: {e}"
+                )
+
+                last_error_message = str(e)
+
+            except Exception as e:
+
+                log(
+                    f"[{label}] "
+                    f"ERROR: {e}"
+                )
+
+                last_error_message = str(e)
+
+            if attempt == 0:
+
+                time.sleep(1)
+
+    raise Exception(
+        last_error_message
+        or f"{label} request failed"
+    )
 
 
 # ============================================================
@@ -128,10 +215,20 @@ def api_get(base_url, path, params=None):
 
 def send_telegram(message):
 
-    if not TELEGRAM_TOKEN or not CHAT_ID:
+    if not TELEGRAM_TOKEN:
 
-        print(
-            "Telegram variables are not configured."
+        log(
+            "[TELEGRAM] "
+            "TELEGRAM_TOKEN is missing"
+        )
+
+        return False
+
+    if not CHAT_ID:
+
+        log(
+            "[TELEGRAM] "
+            "CHAT_ID is missing"
         )
 
         return False
@@ -149,103 +246,183 @@ def send_telegram(message):
                 "chat_id": CHAT_ID,
                 "text": message
             },
-            timeout=20
+            timeout=10
         )
-
-        response.raise_for_status()
 
         result = response.json()
 
-        if not result.get("ok"):
+        if result.get("ok"):
 
-            print(
-                "Telegram error:",
-                result
-            )
+            return True
 
-            return False
+        log(
+            f"[TELEGRAM] Error: "
+            f"{result}"
+        )
 
-        return True
+        return False
 
     except Exception as e:
 
-        print(
-            f"Telegram request failed: {e}"
+        log(
+            f"[TELEGRAM] "
+            f"Request error: {e}"
         )
 
         return False
 
 
 # ============================================================
-# GET SPOT SYMBOLS
+# SPOT SYMBOLS
 # ============================================================
 
 def get_spot_symbols():
 
-    print("Getting Binance Spot symbols...")
+    global spot_api_status
+    global last_error
 
-    data = api_get(
-        SPOT_URL,
-        "/api/v3/exchangeInfo"
+    log("")
+    log(
+        "================================"
+    )
+    log(
+        "TESTING BINANCE SPOT API"
+    )
+    log(
+        "================================"
     )
 
-    if not data:
+    try:
 
-        raise Exception(
-            "Could not get Spot exchangeInfo."
+        data = api_get(
+            SPOT_ENDPOINTS,
+            "/api/v3/exchangeInfo",
+            label="SPOT"
         )
 
-    symbols = []
+        symbols = []
 
-    for item in data.get("symbols", []):
-
-        if (
-            item.get("status") == "TRADING"
-            and item.get("quoteAsset") == "USDT"
-            and item.get("isSpotTradingAllowed") is True
+        for item in data.get(
+            "symbols",
+            []
         ):
 
-            symbols.append(
-                item["symbol"]
-            )
+            if (
+                item.get("status")
+                == "TRADING"
+                and item.get("quoteAsset")
+                == "USDT"
+                and item.get(
+                    "isSpotTradingAllowed"
+                ) is True
+            ):
 
-    return symbols
+                symbols.append(
+                    item["symbol"]
+                )
+
+        spot_api_status = (
+            f"OK ({len(symbols)} symbols)"
+        )
+
+        log(
+            f"[SPOT] SUCCESS: "
+            f"{len(symbols)} symbols"
+        )
+
+        return symbols
+
+    except Exception as e:
+
+        spot_api_status = (
+            f"FAILED: {e}"
+        )
+
+        last_error = (
+            f"Spot API: {e}"
+        )
+
+        log(
+            f"[SPOT] FAILED: {e}"
+        )
+
+        return []
 
 
 # ============================================================
-# GET FUTURES SYMBOLS
+# FUTURES SYMBOLS
 # ============================================================
 
 def get_futures_symbols():
 
-    print("Getting Binance Futures symbols...")
+    global futures_api_status
+    global last_error
 
-    data = api_get(
-        FUTURES_URL,
-        "/fapi/v1/exchangeInfo"
+    log("")
+    log(
+        "================================"
+    )
+    log(
+        "TESTING BINANCE FUTURES API"
+    )
+    log(
+        "================================"
     )
 
-    if not data:
+    try:
 
-        raise Exception(
-            "Could not get Futures exchangeInfo."
+        data = api_get(
+            FUTURES_ENDPOINTS,
+            "/fapi/v1/exchangeInfo",
+            label="FUTURES"
         )
 
-    symbols = []
+        symbols = []
 
-    for item in data.get("symbols", []):
-
-        if (
-            item.get("status") == "TRADING"
-            and item.get("quoteAsset") == "USDT"
-            and item.get("contractType") == "PERPETUAL"
+        for item in data.get(
+            "symbols",
+            []
         ):
 
-            symbols.append(
-                item["symbol"]
-            )
+            if (
+                item.get("status")
+                == "TRADING"
+                and item.get("quoteAsset")
+                == "USDT"
+                and item.get("contractType")
+                == "PERPETUAL"
+            ):
 
-    return symbols
+                symbols.append(
+                    item["symbol"]
+                )
+
+        futures_api_status = (
+            f"OK ({len(symbols)} symbols)"
+        )
+
+        log(
+            f"[FUTURES] SUCCESS: "
+            f"{len(symbols)} symbols"
+        )
+
+        return symbols
+
+    except Exception as e:
+
+        futures_api_status = (
+            f"FAILED: {e}"
+        )
+
+        last_error = (
+            f"Futures API: {e}"
+        )
+
+        log(
+            f"[FUTURES] FAILED: {e}"
+        )
+
+        return []
 
 
 # ============================================================
@@ -259,51 +436,48 @@ def check_coin(
 
     if market == "SPOT":
 
-        base_url = SPOT_URL
+        endpoints = SPOT_ENDPOINTS
         path = "/api/v3/klines"
 
     else:
 
-        base_url = FUTURES_URL
+        endpoints = FUTURES_ENDPOINTS
         path = "/fapi/v1/klines"
-
-    candles = api_get(
-        base_url,
-        path,
-        {
-            "symbol": symbol,
-            "interval": INTERVAL,
-            "limit": WINDOW_CANDLES
-        }
-    )
-
-    if not candles:
-
-        return None
-
-    if len(candles) < 20:
-
-        return None
 
     try:
 
-        # Price at beginning
+        candles = api_get(
+            endpoints,
+            path,
+            {
+                "symbol": symbol,
+                "interval": INTERVAL,
+                "limit": WINDOW_CANDLES
+            },
+            label=f"{market}-{symbol}"
+        )
+
+        if not candles:
+
+            return None
+
+        if len(candles) < 20:
+
+            return None
+
         start_price = float(
             candles[0][1]
         )
 
-        # Highest price during window
         highest_price = max(
             float(candle[2])
             for candle in candles
         )
 
-        # Latest candle close
         current_price = float(
             candles[-1][4]
         )
 
-        # Maximum movement
         change = (
             (highest_price - start_price)
             / start_price
@@ -320,16 +494,11 @@ def check_coin(
 
     except Exception as e:
 
-        print(
-            f"{market} {symbol}: "
-            f"calculation error: {e}"
-        )
-
         return None
 
 
 # ============================================================
-# FORMAT PRICE
+# PRICE FORMAT
 # ============================================================
 
 def format_price(price):
@@ -350,50 +519,46 @@ def format_price(price):
 
 
 # ============================================================
-# CREATE ALERT MESSAGE
+# TELEGRAM MESSAGE
 # ============================================================
 
 def create_message(result):
 
     market = result["market"]
-    symbol = result["symbol"]
-
-    change = result["change"]
-
-    current_price = result["current_price"]
-    highest_price = result["highest_price"]
-    start_price = result["start_price"]
 
     if market == "SPOT":
 
-        market_icon = "🟢"
-        market_name = "SPOT"
+        icon = "🟢"
+        name = "SPOT"
 
     else:
 
-        market_icon = "🔴"
-        market_name = "FUTURES"
+        icon = "🔴"
+        name = "FUTURES"
 
-    message = (
+    return (
         "⚡ The Kingdom Alert\n\n"
-
-        f"{market_icon} Market: {market_name}\n"
-        f"🪙 {symbol}\n\n"
-
-        f"📈 2H Move: +{change:.2f}%\n"
-        f"💰 Current: {format_price(current_price)}\n"
-        f"🔥 2H High: {format_price(highest_price)}\n"
-        f"📍 2H Start: {format_price(start_price)}"
+        f"{icon} Market: {name}\n"
+        f"🪙 {result['symbol']}\n\n"
+        f"📈 2H Move: "
+        f"+{result['change']:.2f}%\n"
+        f"💰 Current: "
+        f"{format_price(result['current_price'])}\n"
+        f"🔥 2H High: "
+        f"{format_price(result['highest_price'])}\n"
+        f"📍 2H Start: "
+        f"{format_price(result['start_price'])}"
     )
-
-    return message
 
 
 # ============================================================
 # PROCESS RESULT
 # ============================================================
 
-def process_result(result, new_alerts):
+def process_result(
+    result,
+    new_alerts
+):
 
     if result is None:
 
@@ -402,15 +567,13 @@ def process_result(result, new_alerts):
     market = result["market"]
     symbol = result["symbol"]
 
-    key = f"{market}:{symbol}"
+    key = (
+        f"{market}:{symbol}"
+    )
 
     change = result["change"]
 
     with state_lock:
-
-        # ====================================================
-        # NEW ALERT
-        # ====================================================
 
         if change >= THRESHOLD:
 
@@ -422,16 +585,12 @@ def process_result(result, new_alerts):
                     result
                 )
 
-                print(
-                    f"NEW ALERT: "
+                log(
+                    f"🚨 NEW ALERT "
                     f"{market} "
                     f"{symbol} "
                     f"+{change:.2f}%"
                 )
-
-        # ====================================================
-        # RESET
-        # ====================================================
 
         else:
 
@@ -439,8 +598,8 @@ def process_result(result, new_alerts):
 
                 alerted.remove(key)
 
-                print(
-                    f"RESET: "
+                log(
+                    f"RESET "
                     f"{market} "
                     f"{symbol}"
                 )
@@ -455,15 +614,29 @@ def scan_market(
     symbols
 ):
 
+    if not symbols:
+
+        log(
+            f"[{market}] "
+            "No symbols to scan."
+        )
+
+        return []
+
     new_alerts = []
 
     total = len(symbols)
 
     completed = 0
 
-    print(
-        f"Scanning {market}: "
-        f"{total} symbols..."
+    log("")
+    log(
+        f"========== {market} SCAN =========="
+    )
+
+    log(
+        f"[{market}] "
+        f"Symbols: {total}"
     )
 
     with ThreadPoolExecutor(
@@ -484,8 +657,6 @@ def scan_market(
             futures
         ):
 
-            symbol = futures[future]
-
             completed += 1
 
             try:
@@ -499,8 +670,12 @@ def scan_market(
 
             except Exception as e:
 
-                print(
-                    f"{market} "
+                symbol = futures[
+                    future
+                ]
+
+                log(
+                    f"[{market}] "
                     f"{symbol}: {e}"
                 )
 
@@ -509,29 +684,33 @@ def scan_market(
                 or completed == total
             ):
 
-                print(
-                    f"{market}: "
+                log(
+                    f"[{market}] "
                     f"{completed}/{total}"
                 )
+
+    log(
+        f"[{market}] Scan finished."
+    )
 
     return new_alerts
 
 
 # ============================================================
-# COMPLETE SCAN
+# FULL SCAN
 # ============================================================
 
 def run_full_scan():
 
+    global scanner_running
     global last_scan_time
     global last_scan_duration
     global spot_count
     global futures_count
-    global scanner_running
 
     if scanner_running:
 
-        print(
+        log(
             "Previous scan is still running."
         )
 
@@ -539,104 +718,141 @@ def run_full_scan():
 
     scanner_running = True
 
-    scan_start = time.time()
+    start_time = time.time()
 
-    print()
-    print("========================================")
-    print("THE KINGDOM RENDER SCANNER")
-    print("========================================")
+    log("")
+    log(
+        "========================================"
+    )
+    log(
+        "THE KINGDOM RENDER SCANNER"
+    )
+    log(
+        "========================================"
+    )
 
-    print(
+    log(
         f"Threshold: +{THRESHOLD}%"
     )
 
-    print(
+    log(
         "Window: approximately 2 hours"
     )
 
-    print(
+    log(
         "Candle: 5 minutes"
     )
 
-    print(
+    log(
         f"Workers: {MAX_WORKERS}"
     )
 
-    print("========================================")
+    log(
+        "========================================"
+    )
 
     try:
 
         # ----------------------------------------------------
-        # GET SYMBOLS
+        # SPOT
         # ----------------------------------------------------
 
         spot_symbols = get_spot_symbols()
 
-        print(
-            f"Spot symbols: "
-            f"{len(spot_symbols)}"
-        )
-
-        futures_symbols = get_futures_symbols()
-
-        print(
-            f"Futures symbols: "
-            f"{len(futures_symbols)}"
-        )
-
         spot_count = len(
             spot_symbols
+        )
+
+        # ----------------------------------------------------
+        # FUTURES
+        # ----------------------------------------------------
+
+        futures_symbols = (
+            get_futures_symbols()
         )
 
         futures_count = len(
             futures_symbols
         )
 
-        # ----------------------------------------------------
-        # SCAN SPOT
-        # ----------------------------------------------------
+        log("")
+        log(
+            "========================================"
+        )
 
-        spot_alerts = scan_market(
-            "SPOT",
-            spot_symbols
+        log(
+            f"Spot symbols: {spot_count}"
+        )
+
+        log(
+            f"Futures symbols: {futures_count}"
+        )
+
+        log(
+            "========================================"
         )
 
         # ----------------------------------------------------
-        # SCAN FUTURES
+        # SCAN
         # ----------------------------------------------------
 
-        futures_alerts = scan_market(
-            "FUTURES",
-            futures_symbols
-        )
+        all_alerts = []
 
-        new_alerts = (
-            spot_alerts
-            + futures_alerts
-        )
+        if spot_symbols:
+
+            spot_alerts = scan_market(
+                "SPOT",
+                spot_symbols
+            )
+
+            all_alerts.extend(
+                spot_alerts
+            )
+
+        else:
+
+            log(
+                "Spot scan skipped."
+            )
+
+        if futures_symbols:
+
+            futures_alerts = scan_market(
+                "FUTURES",
+                futures_symbols
+            )
+
+            all_alerts.extend(
+                futures_alerts
+            )
+
+        else:
+
+            log(
+                "Futures scan skipped."
+            )
 
         # ----------------------------------------------------
-        # SEND TELEGRAM
+        # TELEGRAM
         # ----------------------------------------------------
 
-        print(
+        log("")
+        log(
             f"New alerts: "
-            f"{len(new_alerts)}"
+            f"{len(all_alerts)}"
         )
 
-        for result in new_alerts:
+        for result in all_alerts:
 
             message = create_message(
                 result
             )
 
-            sent = send_telegram(
+            if send_telegram(
                 message
-            )
+            ):
 
-            if sent:
-
-                print(
+                log(
                     f"Telegram sent: "
                     f"{result['market']} "
                     f"{result['symbol']}"
@@ -644,7 +860,7 @@ def run_full_scan():
 
             else:
 
-                print(
+                log(
                     f"Telegram failed: "
                     f"{result['market']} "
                     f"{result['symbol']}"
@@ -656,42 +872,42 @@ def run_full_scan():
 
         elapsed = (
             time.time()
-            - scan_start
+            - start_time
         )
 
         last_scan_duration = elapsed
         last_scan_time = time.time()
 
-        print(
+        log("")
+        log(
             "========================================"
         )
 
-        print(
-            f"Scan completed in "
-            f"{elapsed:.1f}s"
+        log(
+            f"SCAN COMPLETED "
+            f"in {elapsed:.1f}s"
         )
 
-        print(
+        log(
             f"Spot: {spot_count}"
         )
 
-        print(
+        log(
             f"Futures: {futures_count}"
         )
 
-        print(
-            f"New alerts: {len(new_alerts)}"
+        log(
+            f"New alerts: {len(all_alerts)}"
         )
 
-        print(
+        log(
             "========================================"
         )
 
     except Exception as e:
 
-        print(
-            "SCAN ERROR:",
-            repr(e)
+        log(
+            f"FATAL SCAN ERROR: {e}"
         )
 
     finally:
@@ -700,12 +916,12 @@ def run_full_scan():
 
 
 # ============================================================
-# BACKGROUND SCANNER
+# BACKGROUND LOOP
 # ============================================================
 
 async def scanner_loop():
 
-    print(
+    log(
         "Background scanner started."
     )
 
@@ -715,9 +931,14 @@ async def scanner_loop():
         run_full_scan
     )
 
-    # Then every 5 minutes
+    # Repeat every 5 minutes
 
     while True:
+
+        log(
+            "Waiting 5 minutes "
+            "before next scan..."
+        )
 
         await asyncio.sleep(
             SCAN_INTERVAL
@@ -729,26 +950,26 @@ async def scanner_loop():
 
 
 # ============================================================
-# HEALTH ENDPOINT
+# HEALTH
 # ============================================================
 
 async def health(request):
 
-    uptime = time.time()
+    now = time.time()
 
     if last_scan_time:
 
-        seconds_since_scan = (
-            uptime - last_scan_time
+        seconds_ago = (
+            now - last_scan_time
         )
 
     else:
 
-        seconds_since_scan = None
+        seconds_ago = None
 
     with state_lock:
 
-        alert_count = len(
+        active_alerts = len(
             alerted
         )
 
@@ -756,24 +977,49 @@ async def health(request):
         {
             "status": "ok",
             "service": "the-kingdom-render",
-            "scanner_running": scanner_running,
-            "spot_symbols": spot_count,
-            "futures_symbols": futures_count,
-            "active_alerts": alert_count,
-            "last_scan_seconds_ago": (
-                round(seconds_since_scan, 1)
-                if seconds_since_scan is not None
-                else None
-            ),
-            "last_scan_duration": (
-                round(last_scan_duration, 1)
-            )
+
+            "scanner_running":
+                scanner_running,
+
+            "spot_symbols":
+                spot_count,
+
+            "futures_symbols":
+                futures_count,
+
+            "spot_api":
+                spot_api_status,
+
+            "futures_api":
+                futures_api_status,
+
+            "active_alerts":
+                active_alerts,
+
+            "last_scan_seconds_ago":
+                (
+                    round(
+                        seconds_ago,
+                        1
+                    )
+                    if seconds_ago is not None
+                    else None
+                ),
+
+            "last_scan_duration":
+                round(
+                    last_scan_duration,
+                    1
+                ),
+
+            "last_error":
+                last_error
         }
     )
 
 
 # ============================================================
-# HOME PAGE
+# HOME
 # ============================================================
 
 async def home(request):
@@ -781,7 +1027,7 @@ async def home(request):
     return web.Response(
         text=(
             "The Kingdom Render Bot is running.\n\n"
-            "Scanner: Spot + Futures\n"
+            "Spot + Futures\n"
             "Threshold: +23%\n"
             "Window: 2 hours\n"
             "Interval: 5 minutes\n\n"
@@ -809,7 +1055,7 @@ async def main():
         health
     )
 
-    # Start background scanner
+    # Start scanner
 
     asyncio.create_task(
         scanner_loop()
@@ -829,16 +1075,26 @@ async def main():
 
     await site.start()
 
-    print()
-    print("========================================")
-    print("The Kingdom Render Bot is ONLINE")
-    print(
+    log("")
+    log(
+        "========================================"
+    )
+
+    log(
+        "THE KINGDOM RENDER BOT IS ONLINE"
+    )
+
+    log(
         f"Port: {PORT}"
     )
-    print("Health: /health")
-    print("========================================")
 
-    # Keep server alive
+    log(
+        "Health: /health"
+    )
+
+    log(
+        "========================================"
+    )
 
     while True:
 
@@ -853,14 +1109,6 @@ async def main():
 
 if __name__ == "__main__":
 
-    try:
-
-        asyncio.run(
-            main()
-        )
-
-    except KeyboardInterrupt:
-
-        print(
-            "Bot stopped."
-        )
+    asyncio.run(
+        main()
+    )
