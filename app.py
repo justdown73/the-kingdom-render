@@ -3,644 +3,1290 @@ import json
 import os
 import time
 from collections import defaultdict, deque
+from dataclasses import dataclass
+from typing import Deque, Dict, Optional
 
 import aiohttp
+from aiohttp import web
 import websockets
 
 
 # =========================================================
-# THE KINGDOM - RENDER WEBSOCKET SCANNER
+# THE KINGDOM - RENDER EDITION
+# =========================================================
+#
+# Spot + USDⓈ-M Futures
+# Threshold: +23%
+# Window: 25 x 5-minute candles (~2h 5m)
+#
+# IMPORTANT:
+# This version does NOT use Binance REST market-data
+# requests for scanning.
+#
+# It uses Binance WebSocket all-market mini ticker streams
+# and builds local 5-minute candles from live prices.
 # =========================================================
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
 
-THRESHOLD = 23.0
+# =========================================================
+# CONFIG
+# =========================================================
 
-# 2 hours
-WINDOW_SECONDS = 2 * 60 * 60
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+CHAT_ID = os.getenv("CHAT_ID", "").strip()
 
-# 5-minute candle
-INTERVAL = "5m"
+THRESHOLD_PERCENT = 23.0
 
-# Binance allows max 1024 streams per connection.
-# Keep some safety margin.
-STREAMS_PER_CONNECTION = 900
+CANDLE_SECONDS = 5 * 60
 
-
-SPOT_EXCHANGE_INFO = "https://data-api.binance.vision/api/v3/exchangeInfo"
-FUTURES_EXCHANGE_INFO = "https://fapi.binance.com/fapi/v1/exchangeInfo"
-
-SPOT_WS = "wss://stream.binance.com:9443/ws"
-FUTURES_WS = "wss://fstream.binance.com/market/ws"
+# Same setting as the original Kingdom bot.
+# 25 x 5 minutes = 125 minutes (~2 hours)
+WINDOW_CANDLES = 25
 
 
-# ---------------------------------------------------------
-# Global state
-# ---------------------------------------------------------
+# Spot market-data WebSocket.
+# Binance provides a market-data-only endpoint here.
+SPOT_WS_URL = (
+    "wss://data-stream.binance.vision/ws/!miniTicker@arr"
+)
 
-history = {
-    "SPOT": defaultdict(lambda: deque(maxlen=30)),
-    "FUTURES": defaultdict(lambda: deque(maxlen=30)),
+# Current USDⓈ-M Futures market-data WebSocket structure.
+FUTURES_WS_URL = (
+    "wss://fstream.binance.com/market/ws/!miniTicker@arr"
+)
+
+
+# Prevent Telegram alert bursts.
+TELEGRAM_MIN_INTERVAL = 0.55
+
+
+# Render provides PORT automatically.
+PORT = int(os.getenv("PORT", "10000"))
+
+
+# =========================================================
+# DATA STRUCTURES
+# =========================================================
+
+
+@dataclass
+class Candle:
+    start_ms: int
+    open: float
+    high: float
+    close: float
+
+
+class SymbolState:
+    def __init__(self) -> None:
+        self.candles: Deque[Candle] = deque(
+            maxlen=WINDOW_CANDLES
+        )
+
+        self.current_bucket: Optional[int] = None
+
+        self.last_price: Optional[float] = None
+
+        self.last_event_ms: Optional[int] = None
+
+        # Prevent repeated alerts while the same symbol
+        # remains above the threshold.
+        self.alerted: bool = False
+
+
+# Separate Spot and Futures state.
+states: Dict[str, Dict[str, SymbolState]] = {
+    "SPOT": defaultdict(SymbolState),
+    "FUTURES": defaultdict(SymbolState),
 }
 
-alerted = {
-    "SPOT": set(),
-    "FUTURES": set(),
-}
+
+# =========================================================
+# STATS
+# =========================================================
+
 
 stats = {
-    "spot_symbols": 0,
-    "futures_symbols": 0,
-    "spot_connections": 0,
-    "futures_connections": 0,
+    "started_at": time.time(),
+
     "last_spot_event": None,
     "last_futures_event": None,
+
+    "spot_messages": 0,
+    "futures_messages": 0,
+
+    "alerts_queued": 0,
     "alerts_sent": 0,
+
+    "telegram_errors": 0,
+
+    "spot_reconnects": 0,
+    "futures_reconnects": 0,
 }
 
-start_time = time.time()
+
+# =========================================================
+# TELEGRAM QUEUE
+# =========================================================
+
+
+telegram_queue: asyncio.Queue[str] = asyncio.Queue()
+
+telegram_session: Optional[
+    aiohttp.ClientSession
+] = None
 
 
 # =========================================================
-# Logging
+# LOGGING
 # =========================================================
 
-def log(message):
+
+def log(message: str) -> None:
     print(message, flush=True)
 
 
 # =========================================================
-# Telegram
+# HELPERS
 # =========================================================
 
-async def send_telegram(message):
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        log("[TELEGRAM] Missing TELEGRAM_TOKEN or CHAT_ID")
-        return False
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
-
-    try:
-        timeout = aiohttp.ClientTimeout(total=15)
-
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(url, json=payload) as response:
-                text = await response.text()
-
-                if response.status == 200:
-                    stats["alerts_sent"] += 1
-                    log("[TELEGRAM] Alert sent")
-                    return True
-
-                log(f"[TELEGRAM] HTTP {response.status}: {text}")
-                return False
-
-    except Exception as e:
-        log(f"[TELEGRAM] Error: {e}")
-        return False
-
-
-# =========================================================
-# Binance symbol discovery
-# =========================================================
-
-async def get_exchange_info(url, market):
+def format_price(value: float) -> str:
     """
-    Only used once during startup to discover symbols.
-    No kline REST requests are made.
+    Make crypto prices readable without unnecessary zeros.
     """
 
-    log(f"[{market}] Getting exchange info...")
-
-    timeout = aiohttp.ClientTimeout(total=20)
-
-    try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url) as response:
-
-                if response.status != 200:
-                    text = await response.text()
-
-                    log(
-                        f"[{market}] ExchangeInfo HTTP "
-                        f"{response.status}: {text[:300]}"
-                    )
-
-                    return []
-
-                data = await response.json()
-
-        symbols = []
-
-        for item in data.get("symbols", []):
-
-            symbol = item.get("symbol", "")
-            status = item.get("status", "")
-            quote_asset = item.get("quoteAsset", "")
-
-            # Only active USDT markets
-            if (
-                status == "TRADING"
-                and quote_asset == "USDT"
-                and symbol.endswith("USDT")
-            ):
-                symbols.append(symbol.lower())
-
-        symbols = sorted(set(symbols))
-
-        log(
-            f"[{market}] Found {len(symbols)} active USDT symbols"
+    if value >= 1000:
+        return (
+            f"{value:,.4f}"
+            .rstrip("0")
+            .rstrip(".")
         )
 
-        return symbols
+    if value >= 1:
+        return (
+            f"{value:.8f}"
+            .rstrip("0")
+            .rstrip(".")
+        )
 
-    except Exception as e:
-        log(f"[{market}] ExchangeInfo error: {e}")
-        return []
+    if value >= 0.01:
+        return (
+            f"{value:.10f}"
+            .rstrip("0")
+            .rstrip(".")
+        )
 
-
-# =========================================================
-# Alert calculation
-# =========================================================
-
-async def process_candle(market, symbol, candle):
-    """
-    Store closed 5m candles.
-
-    We use:
-        start price = oldest candle OPEN
-        highest     = highest HIGH during the window
-
-    Same basic idea as the original Kingdom scanner.
-    """
-
-    if not candle.get("x"):
-        # Ignore unfinished candle
-        return
-
-    open_price = float(candle["o"])
-    high_price = float(candle["h"])
-    close_price = float(candle["c"])
-
-    now = int(time.time())
-
-    q = history[market][symbol]
-
-    q.append(
-        {
-            "time": now,
-            "open": open_price,
-            "high": high_price,
-            "close": close_price,
-        }
+    return (
+        f"{value:.12f}"
+        .rstrip("0")
+        .rstrip(".")
     )
 
-    # Need roughly 2 hours of 5m candles
-    if len(q) < 25:
-        return
 
-    # Remove candles older than 2 hours
-    cutoff = now - WINDOW_SECONDS
+def is_usdt_symbol(symbol: str) -> bool:
+    return (
+        bool(symbol)
+        and symbol.upper().endswith("USDT")
+    )
 
-    while q and q[0]["time"] < cutoff:
-        q.popleft()
 
-    if len(q) < 20:
-        return
+def symbol_count(market: str) -> int:
+    return len(states[market])
 
-    start_price = q[0]["open"]
+
+def warmed_symbol_count(market: str) -> int:
+    return sum(
+        1
+        for state in states[market].values()
+        if len(state.candles) >= WINDOW_CANDLES
+    )
+
+
+def seconds_ago(timestamp) -> Optional[float]:
+    if timestamp is None:
+        return None
+
+    return round(
+        time.time() - timestamp,
+        1
+    )
+
+
+# =========================================================
+# TELEGRAM MESSAGE
+# =========================================================
+
+
+def build_alert_message(
+    market: str,
+    symbol: str,
+    change: float,
+    start_price: float,
+    high_price: float,
+    current_price: float,
+) -> str:
+
+    market_label = (
+        "SPOT"
+        if market == "SPOT"
+        else "FUTURES"
+    )
+
+    return (
+        "🚨 <b>THE KINGDOM ALERT</b>\n\n"
+
+        f"📊 Market: <b>{market_label}</b>\n"
+
+        f"🪙 Coin: <b>{symbol}</b>\n"
+
+        f"📈 Move: <b>+{change:.2f}%</b>\n"
+
+        f"💰 Start: "
+        f"<b>{format_price(start_price)}</b>\n"
+
+        f"🔥 High: "
+        f"<b>{format_price(high_price)}</b>\n"
+
+        f"💵 Current: "
+        f"<b>{format_price(current_price)}</b>\n"
+
+        f"⏱ Window: <b>~2 Hours</b>\n"
+
+        "📡 Source: "
+        "<b>Binance WebSocket</b>"
+    )
+
+
+# =========================================================
+# TELEGRAM WORKER
+# =========================================================
+
+
+async def telegram_worker() -> None:
+
+    global telegram_session
+
+    while True:
+
+        message = await telegram_queue.get()
+
+        try:
+
+            if (
+                not TELEGRAM_TOKEN
+                or not CHAT_ID
+            ):
+                log(
+                    "[TELEGRAM] "
+                    "TELEGRAM_TOKEN or CHAT_ID is missing"
+                )
+                continue
+
+
+            # Create session only when needed.
+            if (
+                telegram_session is None
+                or telegram_session.closed
+            ):
+                timeout = aiohttp.ClientTimeout(
+                    total=20
+                )
+
+                telegram_session = (
+                    aiohttp.ClientSession(
+                        timeout=timeout
+                    )
+                )
+
+
+            url = (
+                "https://api.telegram.org/"
+                f"bot{TELEGRAM_TOKEN}/sendMessage"
+            )
+
+
+            payload = {
+                "chat_id": CHAT_ID,
+                "text": message,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            }
+
+
+            # Try up to 3 times.
+            for attempt in range(3):
+
+                try:
+
+                    async with telegram_session.post(
+                        url,
+                        json=payload
+                    ) as response:
+
+                        body = await response.text()
+
+
+                        # Success.
+                        if response.status == 200:
+
+                            stats["alerts_sent"] += 1
+
+                            log(
+                                "[TELEGRAM] "
+                                "Alert sent"
+                            )
+
+                            break
+
+
+                        # Telegram rate limit.
+                        if response.status == 429:
+
+                            retry_after = 3
+
+                            try:
+
+                                data = json.loads(body)
+
+                                retry_after = int(
+                                    data
+                                    .get("parameters", {})
+                                    .get(
+                                        "retry_after",
+                                        3
+                                    )
+                                )
+
+                            except Exception:
+                                pass
+
+
+                            log(
+                                "[TELEGRAM] "
+                                f"Rate limited. "
+                                f"Waiting {retry_after}s"
+                            )
+
+
+                            await asyncio.sleep(
+                                max(
+                                    1,
+                                    retry_after
+                                )
+                            )
+
+                            continue
+
+
+                        # Other Telegram error.
+                        stats[
+                            "telegram_errors"
+                        ] += 1
+
+                        log(
+                            "[TELEGRAM] "
+                            f"HTTP {response.status}: "
+                            f"{body[:300]}"
+                        )
+
+                        break
+
+
+                except (
+                    aiohttp.ClientError,
+                    asyncio.TimeoutError
+                ) as exc:
+
+                    if attempt < 2:
+
+                        await asyncio.sleep(
+                            2 * (attempt + 1)
+                        )
+
+                    else:
+
+                        stats[
+                            "telegram_errors"
+                        ] += 1
+
+                        log(
+                            "[TELEGRAM] "
+                            f"Request error: {exc}"
+                        )
+
+
+            # Keep messages separated.
+            await asyncio.sleep(
+                TELEGRAM_MIN_INTERVAL
+            )
+
+
+        finally:
+
+            telegram_queue.task_done()
+
+
+# =========================================================
+# ROLLING 5-MINUTE CANDLE ENGINE
+# =========================================================
+
+
+def add_price_update(
+    market: str,
+    symbol: str,
+    event_ms: int,
+    price: float,
+) -> Optional[
+    tuple[float, float, float]
+]:
+
+    """
+    Convert live mini-ticker updates into local
+    5-minute OHLC candles.
+
+    Returns:
+
+        start_price
+        highest_price
+        current_price
+
+    once enough candles are available.
+    """
+
+    if price <= 0:
+        return None
+
+
+    state = states[market][symbol]
+
+
+    # Find 5-minute bucket.
+    bucket_size_ms = (
+        CANDLE_SECONDS * 1000
+    )
+
+    bucket = (
+        event_ms // bucket_size_ms
+    ) * bucket_size_ms
+
+
+    # -----------------------------------------------------
+    # FIRST UPDATE
+    # -----------------------------------------------------
+
+    if state.current_bucket is None:
+
+        state.current_bucket = bucket
+
+        state.last_price = price
+
+        state.last_event_ms = event_ms
+
+        state.candles.append(
+            Candle(
+                start_ms=bucket,
+                open=price,
+                high=price,
+                close=price,
+            )
+        )
+
+        return None
+
+
+    # -----------------------------------------------------
+    # SAME CANDLE
+    # -----------------------------------------------------
+
+    if bucket == state.current_bucket:
+
+        candle = state.candles[-1]
+
+        if price > candle.high:
+            candle.high = price
+
+        candle.close = price
+
+        state.last_price = price
+
+        state.last_event_ms = event_ms
+
+
+    # -----------------------------------------------------
+    # NEW CANDLE
+    # -----------------------------------------------------
+
+    else:
+
+        previous_price = (
+            state.last_price
+            if state.last_price is not None
+            else price
+        )
+
+
+        gap_buckets = max(
+            1,
+            (
+                bucket
+                - state.current_bucket
+            )
+            // bucket_size_ms
+        )
+
+
+        # If the coin disappeared from the stream
+        # for a very long time, start a fresh window.
+        if gap_buckets >= WINDOW_CANDLES:
+
+            state.candles.clear()
+
+            state.candles.append(
+                Candle(
+                    start_ms=bucket,
+                    open=price,
+                    high=price,
+                    close=price,
+                )
+            )
+
+
+        else:
+
+            # Fill missing buckets with a flat candle
+            # using the last known price.
+            next_bucket = (
+                state.current_bucket
+                + bucket_size_ms
+            )
+
+
+            while next_bucket < bucket:
+
+                state.candles.append(
+                    Candle(
+                        start_ms=next_bucket,
+                        open=previous_price,
+                        high=previous_price,
+                        close=previous_price,
+                    )
+                )
+
+                next_bucket += bucket_size_ms
+
+
+            # Current bucket.
+            state.candles.append(
+                Candle(
+                    start_ms=bucket,
+                    open=price,
+                    high=price,
+                    close=price,
+                )
+            )
+
+
+        state.current_bucket = bucket
+
+        state.last_price = price
+
+        state.last_event_ms = event_ms
+
+
+    # -----------------------------------------------------
+    # NOT ENOUGH HISTORY
+    # -----------------------------------------------------
+
+    if (
+        len(state.candles)
+        < WINDOW_CANDLES
+    ):
+        return None
+
+
+    # -----------------------------------------------------
+    # CALCULATE MOVE
+    # -----------------------------------------------------
+
+    start_price = (
+        state.candles[0].open
+    )
 
     highest_price = max(
-        item["high"]
-        for item in q
+        candle.high
+        for candle in state.candles
     )
 
-    current_price = close_price
+    current_price = (
+        state.candles[-1].close
+    )
+
 
     if start_price <= 0:
-        return
-
-    change = (
-        (highest_price - start_price)
-        / start_price
-    ) * 100
-
-    # -----------------------------------------------------
-    # Alert
-    # -----------------------------------------------------
-
-    if change >= THRESHOLD:
-
-        if symbol not in alerted[market]:
-
-            alerted[market].add(symbol)
-
-            display_symbol = symbol.upper()
-
-            message = (
-                f"🚨 <b>THE KINGDOM ALERT</b>\n\n"
-                f"📊 Market: <b>{market}</b>\n"
-                f"🪙 Coin: <b>{display_symbol}</b>\n"
-                f"📈 Move: <b>+{change:.2f}%</b>\n"
-                f"💰 Start: <b>{start_price:g}</b>\n"
-                f"🔥 High: <b>{highest_price:g}</b>\n"
-                f"💵 Current: <b>{current_price:g}</b>\n"
-                f"⏱ Window: <b>~2 Hours</b>"
-            )
-
-            log(
-                f"[ALERT] {market} {display_symbol} "
-                f"+{change:.2f}%"
-            )
-
-            await send_telegram(message)
-
-    else:
-
-        # Reset after dropping below threshold.
-        if symbol in alerted[market]:
-            alerted[market].remove(symbol)
+        return None
 
 
-# =========================================================
-# WebSocket worker
-# =========================================================
-
-async def websocket_worker(market, symbols, connection_number):
-    if market == "SPOT":
-        base_url = SPOT_WS
-    else:
-        base_url = FUTURES_WS
-
-    log(
-        f"[{market}] Connection #{connection_number} "
-        f"starting with {len(symbols)} streams"
+    return (
+        start_price,
+        highest_price,
+        current_price,
     )
 
-    # Binance stream names
-    streams = [
-        f"{symbol}@kline_{INTERVAL}"
-        for symbol in symbols
-    ]
+
+# =========================================================
+# ALERT EVALUATION
+# =========================================================
+
+
+async def evaluate_update(
+    market: str,
+    symbol: str,
+    event_ms: int,
+    price: float,
+) -> None:
+
+    result = add_price_update(
+        market,
+        symbol,
+        event_ms,
+        price,
+    )
+
+
+    if result is None:
+        return
+
+
+    (
+        start_price,
+        highest_price,
+        current_price,
+    ) = result
+
+
+    change = (
+        (
+            highest_price
+            - start_price
+        )
+        / start_price
+    ) * 100.0
+
+
+    state = states[market][symbol]
+
+
+    # -----------------------------------------------------
+    # ABOVE THRESHOLD
+    # -----------------------------------------------------
+
+    if change >= THRESHOLD_PERCENT:
+
+        # Only one alert while this rolling window
+        # remains above 23%.
+        if not state.alerted:
+
+            state.alerted = True
+
+
+            message = build_alert_message(
+                market=market,
+                symbol=symbol,
+                change=change,
+                start_price=start_price,
+                high_price=highest_price,
+                current_price=current_price,
+            )
+
+
+            await telegram_queue.put(
+                message
+            )
+
+
+            stats[
+                "alerts_queued"
+            ] += 1
+
+
+            log(
+                "[ALERT] "
+                f"{market} "
+                f"{symbol} "
+                f"+{change:.2f}% "
+                f"queue="
+                f"{telegram_queue.qsize()}"
+            )
+
+
+    # -----------------------------------------------------
+    # RESET
+    # -----------------------------------------------------
+
+    else:
+
+        # Once the rolling window falls below
+        # 23%, the symbol can alert again later.
+        state.alerted = False
+
+
+# =========================================================
+# BINANCE WEBSOCKET WORKER
+# =========================================================
+
+
+async def market_stream_worker(
+    market: str,
+    url: str,
+) -> None:
+
+    reconnect_delay = 5
+
 
     while True:
 
         try:
 
             log(
-                f"[{market}] Connection #{connection_number} "
-                f"connecting..."
+                f"[{market}] "
+                "Connecting to Binance WebSocket..."
             )
 
+
             async with websockets.connect(
-                base_url,
+                url,
+
+                # Client-side ping/pong support.
                 ping_interval=20,
                 ping_timeout=60,
+
                 close_timeout=10,
-                max_size=4 * 1024 * 1024,
+
+                max_size=16 * 1024 * 1024,
             ) as ws:
 
                 log(
-                    f"[{market}] Connection #{connection_number} "
-                    f"CONNECTED"
+                    f"[{market}] "
+                    "WebSocket CONNECTED"
                 )
 
-                if market == "SPOT":
-                    stats["spot_connections"] += 1
-                else:
-                    stats["futures_connections"] += 1
 
-                # Subscribe in one message.
-                # This avoids sending hundreds of messages.
-                subscribe_message = {
-                    "method": "SUBSCRIBE",
-                    "params": streams,
-                    "id": connection_number,
-                }
+                # Reset reconnect delay after success.
+                reconnect_delay = 5
 
-                await ws.send(
-                    json.dumps(subscribe_message)
-                )
-
-                log(
-                    f"[{market}] Connection #{connection_number} "
-                    f"subscribed to {len(streams)} streams"
-                )
 
                 async for raw_message in ws:
 
                     try:
-                        data = json.loads(raw_message)
 
-                        # Subscription response
-                        if "result" in data:
+                        data = json.loads(
+                            raw_message
+                        )
+
+
+                        # !miniTicker@arr sends an array.
+                        if not isinstance(
+                            data,
+                            list
+                        ):
                             continue
 
-                        # Combined stream
-                        if "data" in data:
-                            event = data["data"]
-                        else:
-                            event = data
 
-                        if event.get("e") != "kline":
-                            continue
-
-                        candle = event.get("k")
-
-                        if not candle:
-                            continue
-
-                        symbol = event.get("s", "").lower()
-
-                        if not symbol:
-                            continue
+                        # -------------------------------------------------
+                        # STATS
+                        # -------------------------------------------------
 
                         if market == "SPOT":
-                            stats["last_spot_event"] = time.time()
-                        else:
-                            stats["last_futures_event"] = time.time()
 
-                        await process_candle(
-                            market,
-                            symbol,
-                            candle,
-                        )
+                            stats[
+                                "spot_messages"
+                            ] += 1
+
+                            stats[
+                                "last_spot_event"
+                            ] = time.time()
+
+                        else:
+
+                            stats[
+                                "futures_messages"
+                            ] += 1
+
+                            stats[
+                                "last_futures_event"
+                            ] = time.time()
+
+
+                        # -------------------------------------------------
+                        # PROCESS CHANGED TICKERS
+                        # -------------------------------------------------
+
+                        for item in data:
+
+                            if not isinstance(
+                                item,
+                                dict
+                            ):
+                                continue
+
+
+                            symbol = str(
+                                item.get(
+                                    "s",
+                                    ""
+                                )
+                            ).upper()
+
+
+                            # We only want USDT markets.
+                            if not is_usdt_symbol(
+                                symbol
+                            ):
+                                continue
+
+
+                            try:
+
+                                price = float(
+                                    item["c"]
+                                )
+
+
+                                event_ms = int(
+                                    item.get(
+                                        "E",
+                                        int(
+                                            time.time()
+                                            * 1000
+                                        )
+                                    )
+                                )
+
+
+                            except (
+                                KeyError,
+                                TypeError,
+                                ValueError
+                            ):
+
+                                continue
+
+
+                            await evaluate_update(
+                                market,
+                                symbol,
+                                event_ms,
+                                price,
+                            )
+
 
                     except json.JSONDecodeError:
+
                         continue
 
-                    except Exception as e:
+
+                    except Exception as exc:
+
                         log(
-                            f"[{market}] Event processing error: {e}"
+                            f"[{market}] "
+                            "Message processing error: "
+                            f"{exc}"
                         )
 
+
         except asyncio.CancelledError:
+
             raise
 
-        except Exception as e:
+
+        except Exception as exc:
+
+            if market == "SPOT":
+
+                stats[
+                    "spot_reconnects"
+                ] += 1
+
+            else:
+
+                stats[
+                    "futures_reconnects"
+                ] += 1
+
 
             log(
-                f"[{market}] Connection #{connection_number} "
-                f"ERROR: {e}"
+                f"[{market}] "
+                f"WebSocket error: {exc}"
             )
+
 
             log(
-                f"[{market}] Connection #{connection_number} "
-                f"reconnecting in 10 seconds..."
+                f"[{market}] "
+                f"Reconnecting in "
+                f"{reconnect_delay}s..."
             )
 
-            await asyncio.sleep(10)
 
-
-# =========================================================
-# Start WebSocket connections
-# =========================================================
-
-async def start_market_streams(market, symbols):
-
-    if not symbols:
-        log(f"[{market}] No symbols available.")
-        return
-
-    chunks = [
-        symbols[i:i + STREAMS_PER_CONNECTION]
-        for i in range(
-            0,
-            len(symbols),
-            STREAMS_PER_CONNECTION
-        )
-    ]
-
-    log(
-        f"[{market}] Total connections required: "
-        f"{len(chunks)}"
-    )
-
-    tasks = []
-
-    for index, chunk in enumerate(chunks, start=1):
-
-        task = asyncio.create_task(
-            websocket_worker(
-                market,
-                chunk,
-                index,
+            await asyncio.sleep(
+                reconnect_delay
             )
-        )
 
-        tasks.append(task)
 
-        # Small delay between connections
-        await asyncio.sleep(2)
-
-    await asyncio.gather(*tasks)
+            # Exponential backoff.
+            reconnect_delay = min(
+                reconnect_delay * 2,
+                60
+            )
 
 
 # =========================================================
-# Health server
+# HEALTH ENDPOINT
 # =========================================================
 
-async def health_handler(request):
 
-    now = time.time()
+async def health(
+    request: web.Request
+) -> web.Response:
 
-    def age(timestamp):
-        if timestamp is None:
-            return None
-
-        return round(now - timestamp, 1)
-
-    return aiohttp.web.json_response(
+    return web.json_response(
         {
             "status": "ok",
-            "service": "the-kingdom-render",
 
-            "scanner": {
-                "running": True,
-                "uptime_seconds": round(
-                    now - start_time,
+            "service":
+                "the-kingdom-render",
+
+            "scanner_running":
+                True,
+
+            "uptime_seconds":
+                round(
+                    time.time()
+                    - stats["started_at"],
                     1
                 ),
-            },
+
 
             "markets": {
-                "spot_symbols": stats["spot_symbols"],
-                "futures_symbols": stats["futures_symbols"],
-                "spot_connections": stats["spot_connections"],
-                "futures_connections": stats["futures_connections"],
+
+                "spot_symbols_seen":
+                    symbol_count("SPOT"),
+
+                "futures_symbols_seen":
+                    symbol_count("FUTURES"),
+
+                "spot_warmed_symbols":
+                    warmed_symbol_count("SPOT"),
+
+                "futures_warmed_symbols":
+                    warmed_symbol_count(
+                        "FUTURES"
+                    ),
             },
+
 
             "websocket": {
-                "last_spot_event_seconds_ago":
-                    age(stats["last_spot_event"]),
 
-                "last_futures_event_seconds_ago":
-                    age(stats["last_futures_event"]),
+                "spot_last_event_seconds_ago":
+                    seconds_ago(
+                        stats[
+                            "last_spot_event"
+                        ]
+                    ),
+
+                "futures_last_event_seconds_ago":
+                    seconds_ago(
+                        stats[
+                            "last_futures_event"
+                        ]
+                    ),
+
+                "spot_reconnects":
+                    stats[
+                        "spot_reconnects"
+                    ],
+
+                "futures_reconnects":
+                    stats[
+                        "futures_reconnects"
+                    ],
             },
 
-            "alerts_sent": stats["alerts_sent"],
 
-            "active_alerts": {
-                "spot": len(alerted["SPOT"]),
-                "futures": len(alerted["FUTURES"]),
+            "alerts": {
+
+                "queued":
+                    stats[
+                        "alerts_queued"
+                    ],
+
+                "sent":
+                    stats[
+                        "alerts_sent"
+                    ],
+
+                "queue_size":
+                    telegram_queue.qsize(),
+
+                "telegram_errors":
+                    stats[
+                        "telegram_errors"
+                    ],
             },
 
-            "warmup": {
-                "message":
-                    "Scanner needs about 2 hours of live candle history after a fresh restart."
+
+            "config": {
+
+                "threshold_percent":
+                    THRESHOLD_PERCENT,
+
+                "candle_minutes":
+                    5,
+
+                "window_candles":
+                    WINDOW_CANDLES,
+
+                "window_approx_minutes":
+                    WINDOW_CANDLES * 5,
+
+                "binance_rest_market_requests":
+                    0,
             },
+
+
+            "note":
+                (
+                    "A fresh process needs "
+                    "about 25 live 5-minute "
+                    "buckets before the full "
+                    "rolling-window detector "
+                    "becomes active."
+                ),
         }
     )
 
 
-async def start_health_server():
+# =========================================================
+# HEALTH SERVER
+# =========================================================
 
-    app = aiohttp.web.Application()
+
+async def start_health_server() -> web.AppRunner:
+
+    app = web.Application()
+
 
     app.router.add_get(
         "/",
-        health_handler,
+        health
     )
+
 
     app.router.add_get(
         "/health",
-        health_handler,
+        health
     )
 
-    port = int(
-        os.getenv(
-            "PORT",
-            "10000"
-        )
+
+    runner = web.AppRunner(
+        app
     )
 
-    runner = aiohttp.web.AppRunner(app)
 
     await runner.setup()
 
-    site = aiohttp.web.TCPSite(
+
+    site = web.TCPSite(
         runner,
-        "0.0.0.0",
-        port,
+
+        host="0.0.0.0",
+
+        port=PORT,
     )
+
 
     await site.start()
 
+
     log(
-        f"[HEALTH] Server running on port {port}"
+        f"[HEALTH] "
+        f"Listening on "
+        f"0.0.0.0:{PORT}"
     )
 
 
+    return runner
+
+
 # =========================================================
-# Main
+# CLEANUP
 # =========================================================
 
-async def main():
+
+async def shutdown_health_server(
+    runner: Optional[web.AppRunner]
+) -> None:
+
+    global telegram_session
+
+
+    if runner is not None:
+
+        await runner.cleanup()
+
+
+    if (
+        telegram_session is not None
+        and not telegram_session.closed
+    ):
+
+        await telegram_session.close()
+
+
+# =========================================================
+# MAIN
+# =========================================================
+
+
+async def main() -> None:
 
     log("")
-    log("==============================================")
-    log("       THE KINGDOM RENDER BOT")
-    log("==============================================")
-    log("WebSocket scanner starting...")
+
+    log(
+        "=============================================="
+    )
+
+    log(
+        "        THE KINGDOM RENDER BOT"
+    )
+
+    log(
+        "=============================================="
+    )
+
+    log(
+        "Starting WebSocket-only scanner..."
+    )
+
+    log(
+        f"Threshold: "
+        f"+{THRESHOLD_PERCENT:.1f}%"
+    )
+
+    log(
+        f"Window: "
+        f"{WINDOW_CANDLES} x 5m "
+        f"(~{WINDOW_CANDLES * 5} minutes)"
+    )
+
+    log(
+        "Binance REST market-data requests: 0"
+    )
+
     log("")
+
 
     if not TELEGRAM_TOKEN:
-        log("[WARNING] TELEGRAM_TOKEN missing")
-
-    if not CHAT_ID:
-        log("[WARNING] CHAT_ID missing")
-
-    await start_health_server()
-
-    # -----------------------------------------------------
-    # Get symbols
-    # -----------------------------------------------------
-
-    spot_symbols_task = asyncio.create_task(
-        get_exchange_info(
-            SPOT_EXCHANGE_INFO,
-            "SPOT",
-        )
-    )
-
-    futures_symbols_task = asyncio.create_task(
-        get_exchange_info(
-            FUTURES_EXCHANGE_INFO,
-            "FUTURES",
-        )
-    )
-
-    spot_symbols, futures_symbols = await asyncio.gather(
-        spot_symbols_task,
-        futures_symbols_task,
-    )
-
-    stats["spot_symbols"] = len(spot_symbols)
-    stats["futures_symbols"] = len(futures_symbols)
-
-    log("")
-    log(
-        f"[START] Spot symbols: {len(spot_symbols)}"
-    )
-    log(
-        f"[START] Futures symbols: {len(futures_symbols)}"
-    )
-    log("")
-
-    if not spot_symbols and not futures_symbols:
 
         log(
-            "[FATAL] No symbols received from Binance."
+            "[WARNING] "
+            "TELEGRAM_TOKEN is not set"
         )
 
-        # Keep health endpoint alive.
-        while True:
-            await asyncio.sleep(60)
+
+    if not CHAT_ID:
+
+        log(
+            "[WARNING] "
+            "CHAT_ID is not set"
+        )
+
+
+    runner = None
 
     tasks = []
 
-    if spot_symbols:
+
+    try:
+
+        # Start health endpoint.
+        runner = await start_health_server()
+
+
+        # Telegram worker.
         tasks.append(
             asyncio.create_task(
-                start_market_streams(
+                telegram_worker()
+            )
+        )
+
+
+        # Spot WebSocket.
+        tasks.append(
+            asyncio.create_task(
+                market_stream_worker(
                     "SPOT",
-                    spot_symbols,
+                    SPOT_WS_URL,
                 )
             )
         )
 
-    if futures_symbols:
+
+        # Futures WebSocket.
         tasks.append(
             asyncio.create_task(
-                start_market_streams(
+                market_stream_worker(
                     "FUTURES",
-                    futures_symbols,
+                    FUTURES_WS_URL,
                 )
             )
         )
 
-    await asyncio.gather(*tasks)
+
+        await asyncio.gather(
+            *tasks
+        )
+
+
+    finally:
+
+        # Cancel workers on shutdown.
+        for task in tasks:
+            task.cancel()
+
+
+        if tasks:
+
+            await asyncio.gather(
+                *tasks,
+                return_exceptions=True
+            )
+
+
+        await shutdown_health_server(
+            runner
+        )
 
 
 # =========================================================
-# Run
+# RUN
 # =========================================================
+
 
 if __name__ == "__main__":
 
     try:
+
         asyncio.run(main())
 
     except KeyboardInterrupt:
-        log("Bot stopped.")
 
-    except Exception as e:
-        log(f"[FATAL] {e}")
+        log(
+            "Bot stopped."
+        )
+
+    except Exception as exc:
+
+        log(
+            f"[FATAL] {exc}"
+        )
